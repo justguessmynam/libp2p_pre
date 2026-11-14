@@ -1,5 +1,5 @@
 group 'io.github.tronprotocol'
-version '2.2.9'
+version '2.2.9-listener.1-SNAPSHOT'
 
 buildscript {
     repositories {

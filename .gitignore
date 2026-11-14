@@ -9,6 +9,7 @@ src/main/java/org/tron/p2p/protos
 # gradle
 .gradle
 build
+bin/
 
 # log
 logs
