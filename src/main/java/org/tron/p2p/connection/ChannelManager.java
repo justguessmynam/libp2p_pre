@@ -57,7 +57,7 @@ public class ChannelManager {
 
   @Getter
   private static final Cache<InetAddress, Long> bannedNodes = CacheBuilder
-      .newBuilder().maximumSize(2000).build(); //ban timestamp
+      .newBuilder().maximumSize(2000).build(); // ban timestamp
 
   private static boolean isInit = false;
   public static volatile boolean isShutdown = false;
@@ -199,7 +199,6 @@ public class ChannelManager {
     nodeDetectService.close();
   }
 
-
   public static void processMessage(Channel channel, byte[] data) throws P2pException {
     if (data == null || data.length == 0) {
       throw new P2pException(TypeEnum.EMPTY_MESSAGE, "");
@@ -236,6 +235,8 @@ public class ChannelManager {
         nodeDetectService.processMessage(channel, message);
         break;
       case DISCONNECT:
+        P2pDisconnectMessage disconnectMessage = (P2pDisconnectMessage) message;
+        channel.recordRemoteDisconnectReason(disconnectMessage.getReason());
         channel.close();
         break;
       default:

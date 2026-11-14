@@ -5,7 +5,6 @@ import org.tron.p2p.connection.message.MessageType;
 import org.tron.p2p.protos.Connect;
 import org.tron.p2p.protos.Connect.DisconnectReason;
 
-
 public class P2pDisconnectMessage extends Message {
 
   private Connect.P2pDisconnectMessage p2pDisconnectMessage;
@@ -22,7 +21,7 @@ public class P2pDisconnectMessage extends Message {
     this.data = p2pDisconnectMessage.toByteArray();
   }
 
-  private DisconnectReason getReason() {
+  public DisconnectReason getReason() {
     return p2pDisconnectMessage.getReason();
   }
 

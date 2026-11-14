@@ -23,11 +23,13 @@ import org.apache.commons.lang3.StringUtils;
 import org.tron.p2p.base.Parameter;
 import org.tron.p2p.connection.business.upgrade.UpgradeController;
 import org.tron.p2p.connection.message.Message;
+import org.tron.p2p.connection.message.base.P2pDisconnectMessage;
 import org.tron.p2p.connection.message.handshake.HelloMessage;
 import org.tron.p2p.connection.socket.MessageHandler;
 import org.tron.p2p.connection.socket.P2pProtobufVarint32FrameDecoder;
 import org.tron.p2p.discover.Node;
 import org.tron.p2p.exception.P2pException;
+import org.tron.p2p.protos.Connect.DisconnectReason;
 import org.tron.p2p.stats.TrafficStats;
 import org.tron.p2p.utils.ByteArray;
 
@@ -76,6 +78,14 @@ public class Channel {
   private long avgLatency;
   private long count;
 
+  // Reason selected by this node when closing the connection.
+  @Getter
+  private volatile DisconnectReason localDisconnectReason = DisconnectReason.UNKNOWN;
+
+  // Reason received from the remote peer.
+  @Getter
+  private volatile DisconnectReason remoteDisconnectReason = DisconnectReason.UNKNOWN;
+
   public void init(ChannelPipeline pipeline, String nodeId, boolean discoveryMode) {
     this.discoveryMode = discoveryMode;
     this.nodeId = nodeId;
@@ -113,7 +123,7 @@ public class Channel {
   public void setHelloMessage(HelloMessage helloMessage) {
     this.helloMessage = helloMessage;
     this.node = helloMessage.getFrom();
-    this.nodeId = node.getHexId(); //update node id from handshake
+    this.nodeId = node.getHexId(); // update node id from handshake
     this.version = helloMessage.getVersion();
   }
 
@@ -131,11 +141,35 @@ public class Channel {
     ctx.close();
   }
 
+  public void recordLocalDisconnectReason(DisconnectReason reason) {
+    if (reason != null) {
+      localDisconnectReason = reason;
+    }
+  }
+
+  public void recordRemoteDisconnectReason(DisconnectReason reason) {
+    if (reason != null) {
+      remoteDisconnectReason = reason;
+    }
+  }
+
+  public DisconnectReason getDisconnectReason() {
+    if (remoteDisconnectReason != DisconnectReason.UNKNOWN) {
+      return remoteDisconnectReason;
+    }
+    return localDisconnectReason;
+  }
+
   public void close() {
     close(Parameter.DEFAULT_BAN_TIME);
   }
 
   public void send(Message message) {
+    if (message instanceof P2pDisconnectMessage) {
+      recordLocalDisconnectReason(
+          ((P2pDisconnectMessage) message).getReason());
+    }
+
     if (message.needToLog()) {
       log.info("Send message to channel {}, {}", inetSocketAddress, message);
     } else {

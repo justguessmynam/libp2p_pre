@@ -37,9 +37,13 @@ public class HandshakeService implements MessageProcess {
 
     DisconnectCode code = ChannelManager.processPeer(channel);
     if (code != DisconnectCode.NORMAL) {
+      DisconnectReason reason = getDisconnectReason(code);
+
       if (!channel.isActive()) {
         sendHelloMsg(channel, code, msg.getTimestamp());
       }
+
+      channel.recordLocalDisconnectReason(reason);
       logDisconnectReason(channel, getDisconnectReason(code));
       channel.close();
       return;
@@ -51,17 +55,31 @@ public class HandshakeService implements MessageProcess {
     }
 
     if (channel.isActive()) {
-      if (msg.getCode() != DisconnectCode.NORMAL.getValue()
-          || (msg.getNetworkId() != networkId && msg.getVersion() != networkId)) {
+      boolean remoteRejected = msg.getCode() != DisconnectCode.NORMAL.getValue();
+      boolean incompatibleNetwork = msg.getNetworkId() != networkId
+          && msg.getVersion() != networkId;
+
+      if (remoteRejected || incompatibleNetwork) {
         DisconnectCode disconnectCode = DisconnectCode.forNumber(msg.getCode());
-        //v0.1 have version, v0.2 both have version and networkId
-        log.info("Handshake failed {}, code: {}, reason: {}, networkId: {}, version: {}",
+
+        DisconnectReason reason;
+        if (remoteRejected && disconnectCode != null) {
+          reason = getDisconnectReason(disconnectCode);
+          channel.recordRemoteDisconnectReason(reason);
+        } else {
+          reason = DisconnectReason.DIFFERENT_VERSION;
+          channel.recordLocalDisconnectReason(reason);
+        }
+
+        log.info(
+            "Handshake failed {}, code: {}, reason: {}, networkId: {}, version: {}",
             channel.getInetSocketAddress(),
             msg.getCode(),
-            disconnectCode.name(),
+            reason,
             msg.getNetworkId(),
             msg.getVersion());
-        logDisconnectReason(channel, getDisconnectReason(disconnectCode));
+
+        logDisconnectReason(channel, reason);
         channel.close();
         return;
       }
@@ -71,6 +89,7 @@ public class HandshakeService implements MessageProcess {
         log.info("Peer {} different network id, peer->{}, me->{}",
             channel.getInetSocketAddress(), msg.getNetworkId(), networkId);
         sendHelloMsg(channel, DisconnectCode.DIFFERENT_VERSION, msg.getTimestamp());
+        channel.recordLocalDisconnectReason(DisconnectReason.DIFFERENT_VERSION);
         logDisconnectReason(channel, DisconnectReason.DIFFERENT_VERSION);
         channel.close();
         return;
