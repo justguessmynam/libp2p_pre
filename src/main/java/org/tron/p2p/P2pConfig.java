@@ -4,6 +4,8 @@ import java.net.InetAddress;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.List;
+import java.util.Map;
+import java.util.concurrent.ConcurrentHashMap;
 import java.util.concurrent.CopyOnWriteArrayList;
 import lombok.Data;
 import org.tron.p2p.dns.update.PublishConfig;
@@ -14,6 +16,10 @@ public class P2pConfig {
 
   private List<InetSocketAddress> seedNodes = new CopyOnWriteArrayList<>();
   private List<InetSocketAddress> activeNodes = new CopyOnWriteArrayList<>();
+
+  // Target address to its connection time-grid reference timestamp.
+  private Map<InetSocketAddress, Long> myAddressTimeMap = new ConcurrentHashMap<>();
+
   private List<InetAddress> trustNodes = new CopyOnWriteArrayList<>();
   private byte[] nodeID = NetUtil.getNodeId();
   private String ip = NetUtil.getExternalIpV4();
@@ -29,9 +35,9 @@ public class P2pConfig {
   private boolean disconnectionPolicyEnable = false;
   private boolean nodeDetectEnable = false;
 
-  //dns read config
+  // dns read config
   private List<String> treeUrls = new ArrayList<>();
 
-  //dns publish config
+  // dns publish config
   private PublishConfig publishConfig = new PublishConfig();
 }
