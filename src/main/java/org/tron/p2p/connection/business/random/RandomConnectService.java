@@ -10,6 +10,7 @@ import java.util.LinkedHashSet;
 import java.util.List;
 import java.util.Map;
 import java.util.Set;
+import java.util.TreeSet;
 import java.util.concurrent.ThreadLocalRandom;
 import java.util.concurrent.Executors;
 import java.util.concurrent.ScheduledExecutorService;
@@ -29,6 +30,9 @@ public class RandomConnectService {
   // 拨号超过该时间仍未产生结果时，释放dialing状态。
   private static final long DIALING_TIMEOUT_MILLIS = 15_000L;
 
+  // 随机连接目标状态的统计日志间隔。
+  private static final long STATS_INTERVAL_SECONDS = 150L;
+
   private final PeerClient peerClient;
   private final TargetStateRepo targetStateRepo;
   private final DialTimePolicy dialTimePolicy;
@@ -40,6 +44,13 @@ public class RandomConnectService {
       BasicThreadFactory.builder()
           .namingPattern("random-connect-%d")
           .build());
+
+  // 独立输出统计日志，避免影响高频连接扫描。
+  private final ScheduledExecutorService statsScheduler =
+      Executors.newSingleThreadScheduledExecutor(
+          BasicThreadFactory.builder()
+              .namingPattern("random-connect-stats-%d")
+              .build());
 
   private volatile boolean started;
 
@@ -90,6 +101,12 @@ public class RandomConnectService {
         scanIntervalMillis,
         TimeUnit.MILLISECONDS);
 
+    statsScheduler.scheduleAtFixedRate(
+        this::safeLogRandomStats,
+        0,
+        STATS_INTERVAL_SECONDS,
+        TimeUnit.SECONDS);
+
     log.info(
         "RandomConnectService started, scanInterval={}ms",
         scanIntervalMillis);
@@ -105,6 +122,7 @@ public class RandomConnectService {
 
     started = false;
     scheduler.shutdownNow();
+    statsScheduler.shutdownNow();
 
     log.info("RandomConnectService stopped");
   }
@@ -328,6 +346,151 @@ public class RandomConnectService {
 
   public int getTargetCount() {
     return targetStateRepo.size();
+  }
+
+  /**
+   * 返回已完成TRON握手的目标数量。
+   */
+  public int getConnectedTargetCount() {
+    int count = 0;
+    for (TargetPeerState state : targetStateRepo.all()) {
+      if (state.isHandshakeComplete()) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 返回正在拨号或等待TRON握手的目标数量。
+   */
+  public int getPendingTargetCount() {
+    int count = 0;
+    for (TargetPeerState state : targetStateRepo.all()) {
+      if (state.isDialing()
+          || (state.isChannelConnected() && !state.isHandshakeComplete())) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 返回已占用连接流程的目标数量。
+   */
+  public int getOccupiedTargetCount() {
+    int count = 0;
+    for (TargetPeerState state : targetStateRepo.all()) {
+      if (state.isDialing()
+          || state.isChannelConnected()
+          || state.isHandshakeComplete()) {
+        count++;
+      }
+    }
+    return count;
+  }
+
+  /**
+   * 输出统计日志时隔离异常，避免定时任务永久停止。
+   */
+  private void safeLogRandomStats() {
+    if (!started) {
+      return;
+    }
+
+    try {
+      logRandomStats();
+    } catch (Throwable t) {
+      log.error("Random connect stats failed", t);
+    }
+  }
+
+  /**
+   * 汇总目标运行状态，并保留旧版按IP划分的连接统计日志。
+   */
+  private void logRandomStats() {
+    int handshakeComplete = 0;
+    int tcpPendingHandshake = 0;
+    int dialing = 0;
+    int idle = 0;
+    int randomElimination = 0;
+
+    Set<String> connectedIps = new TreeSet<>();
+    Set<String> connectedRandomEliIps = new TreeSet<>();
+    Set<String> unconnectedIps = new TreeSet<>();
+    Set<String> unconnectedRandomEliIps = new TreeSet<>();
+
+    Collection<TargetPeerState> states = targetStateRepo.all();
+    for (TargetPeerState state : states) {
+      boolean connected;
+      boolean eliminated;
+
+      synchronized (state) {
+        connected = state.isHandshakeComplete();
+        eliminated = state.getLastRandomEliminationAt() > 0;
+
+        if (connected) {
+          handshakeComplete++;
+        } else if (state.isDialing()) {
+          dialing++;
+        } else if (state.isChannelConnected()) {
+          tcpPendingHandshake++;
+        } else {
+          idle++;
+        }
+
+        if (eliminated) {
+          randomElimination++;
+        }
+      }
+
+      String ip = targetIp(state);
+      if (ip == null) {
+        continue;
+      }
+
+      if (connected) {
+        connectedIps.add(ip);
+        if (eliminated) {
+          connectedRandomEliIps.add(ip);
+        }
+      } else {
+        unconnectedIps.add(ip);
+        if (eliminated) {
+          unconnectedRandomEliIps.add(ip);
+        }
+      }
+    }
+
+    log.info(
+        "RANDOM_TARGET_STATS total={}, handshakeComplete={}, "
+            + "tcpPendingHandshake={}, dialing={}, idle={}, randomElimination={}",
+        states.size(),
+        handshakeComplete,
+        tcpPendingHandshake,
+        dialing,
+        idle,
+        randomElimination);
+
+    log.info(
+        "RANDOM_CONNECTED total={}, ips={}, randomEliIps={}",
+        connectedIps.size(),
+        connectedIps,
+        connectedRandomEliIps);
+
+    log.info(
+        "RANDOM_UNCONNECTED total={}, ips={}, randomEliIps={}",
+        unconnectedIps.size(),
+        unconnectedIps,
+        unconnectedRandomEliIps);
+  }
+
+  private String targetIp(TargetPeerState state) {
+    InetSocketAddress address = state == null ? null : state.getAddress();
+    if (address == null || address.getAddress() == null) {
+      return null;
+    }
+    return address.getAddress().getHostAddress();
   }
 
   /**
