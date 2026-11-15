@@ -21,6 +21,9 @@ import org.tron.p2p.connection.business.handshake.DisconnectCode;
 import org.tron.p2p.connection.business.handshake.HandshakeService;
 import org.tron.p2p.connection.business.keepalive.KeepAliveService;
 import org.tron.p2p.connection.business.pool.ConnPoolService;
+import org.tron.p2p.connection.business.random.DialTimePolicy;
+import org.tron.p2p.connection.business.random.RandomConnectService;
+import org.tron.p2p.connection.business.random.TargetStateRepo;
 import org.tron.p2p.connection.message.Message;
 import org.tron.p2p.connection.message.MessageType;
 import org.tron.p2p.connection.message.base.P2pDisconnectMessage;
@@ -36,10 +39,28 @@ import org.tron.p2p.utils.NetUtil;
 @Slf4j(topic = "net")
 public class ChannelManager {
 
+  // 相邻随机连接时机的时间网格。
+  private static final long RANDOM_CONNECT_GRID_MILLIS = 30_000L;
+
+  // 同一个目标两次连接尝试的最小间隔。
+  private static final long RANDOM_CONNECT_MIN_ATTEMPT_INTERVAL_MILLIS = 60_000L;
+
+  // 计算连接时机时要求保留的最小提前量。
+  private static final long RANDOM_CONNECT_MIN_LEAD_MILLIS = 200L;
+
+  // 连接失败或断开后的冷却时间。
+  private static final long RANDOM_CONNECT_COOLDOWN_MILLIS = 60_000L;
+
+  // 检查目标连接时机的扫描间隔。
+  private static final long RANDOM_CONNECT_SCAN_INTERVAL_MILLIS = 50L;
+
   @Getter
   private static NodeDetectService nodeDetectService;
 
   private static PeerServer peerServer;
+
+  @Getter
+  private static RandomConnectService randomConnectService;
 
   @Getter
   private static PeerClient peerClient;
@@ -72,9 +93,79 @@ public class ChannelManager {
     nodeDetectService = new NodeDetectService();
     peerServer.init();
     peerClient.init();
+
+    randomConnectService = new RandomConnectService(
+        peerClient,
+        new TargetStateRepo(),
+        new DialTimePolicy(
+            RANDOM_CONNECT_GRID_MILLIS,
+            RANDOM_CONNECT_MIN_ATTEMPT_INTERVAL_MILLIS,
+            RANDOM_CONNECT_MIN_LEAD_MILLIS),
+        RANDOM_CONNECT_COOLDOWN_MILLIS,
+        RANDOM_CONNECT_SCAN_INTERVAL_MILLIS);
+
+    randomConnectService.initializeTargets(
+        Parameter.p2pConfig.getActiveNodes(),
+        Parameter.p2pConfig.getMyAddressTimeMap());
+
+    randomConnectService.start();
+
     keepAliveService.init();
     connPoolService.init(peerClient);
     nodeDetectService.init(peerClient);
+  }
+
+  /**
+   * 返回channel对应的RandomConnectService目标地址。
+   */
+  private static InetSocketAddress getManagedTargetAddress(
+      Channel channel) {
+    if (channel == null || randomConnectService == null) {
+      return null;
+    }
+
+    /*
+     * 对于本节点主动建立的连接，socket远端地址通常就是
+     * activeNodes中配置的目标地址。
+     */
+    InetSocketAddress socketAddress = channel.getInetSocketAddress();
+
+    if (randomConnectService.isManagedTarget(socketAddress)) {
+      return socketAddress;
+    }
+
+    /*
+     * 对方主动连接本节点时，TCP来源端口可能是临时端口。
+     * 此时使用握手消息中声明的P2P服务地址进行匹配。
+     */
+    Node remoteNode = channel.getNode();
+
+    if (remoteNode == null) {
+      return null;
+    }
+
+    InetSocketAddress advertisedAddress = remoteNode.getPreferInetSocketAddress();
+
+    if (randomConnectService.isManagedTarget(advertisedAddress)) {
+      return advertisedAddress;
+    }
+
+    return null;
+  }
+
+  /**
+   * 将握手完成事件通知给受管目标。
+   */
+  public static void notifyHandshakeComplete(Channel channel) {
+    InetSocketAddress targetAddress = getManagedTargetAddress(channel);
+
+    if (targetAddress == null) {
+      return;
+    }
+
+    randomConnectService.onHandshakeComplete(
+        targetAddress,
+        System.currentTimeMillis());
   }
 
   public static void connect(InetSocketAddress address) {
@@ -87,15 +178,36 @@ public class ChannelManager {
   }
 
   public static void notifyDisconnect(Channel channel) {
-    if (channel.getInetSocketAddress() == null) {
+    /*
+     * 在channel从连接表删除之前，直接从当前业务Channel中
+     * 读取目标地址和断开原因，避免关闭后再次查询失败。
+     */
+    InetSocketAddress targetAddress = getManagedTargetAddress(channel);
+
+    if (targetAddress != null) {
+      randomConnectService.onDisconnected(
+          targetAddress,
+          channel.getDisconnectReason(),
+          System.currentTimeMillis());
+    }
+
+    InetSocketAddress socketAddress = channel.getInetSocketAddress();
+
+    if (socketAddress == null) {
       log.warn("Notify Disconnect peer has no address.");
       return;
     }
-    channels.remove(channel.getInetSocketAddress());
-    Parameter.handlerList.forEach(h -> h.onDisconnect(channel));
+
+    channels.remove(socketAddress);
+
+    Parameter.handlerList.forEach(
+        handler -> handler.onDisconnect(channel));
+
     InetAddress inetAddress = channel.getInetAddress();
     if (inetAddress != null) {
-      banNode(inetAddress, Parameter.DEFAULT_BAN_TIME);
+      banNode(
+          inetAddress,
+          Parameter.DEFAULT_BAN_TIME);
     }
   }
 
@@ -192,6 +304,13 @@ public class ChannelManager {
       return;
     }
     isShutdown = true;
+    /*
+     * 必须先停止随机连接扫描，避免PeerClient关闭过程中
+     * 仍然产生新的连接请求。
+     */
+    if (randomConnectService != null) {
+      randomConnectService.stop();
+    }
     connPoolService.close();
     keepAliveService.close();
     peerServer.close();
@@ -257,14 +376,22 @@ public class ChannelManager {
 
     if (!channel.isFinishHandshake()) {
       channel.setFinishHandshake(true);
+
       DisconnectCode code = processPeer(channel);
       if (!DisconnectCode.NORMAL.equals(code)) {
         DisconnectReason disconnectReason = getDisconnectReason(code);
-        channel.send(new P2pDisconnectMessage(disconnectReason));
+
+        channel.send(
+            new P2pDisconnectMessage(disconnectReason));
+
         channel.getCtx().close();
         return;
       }
-      Parameter.handlerList.forEach(h -> h.onConnect(channel));
+
+      notifyHandshakeComplete(channel);
+
+      Parameter.handlerList.forEach(
+          handler -> handler.onConnect(channel));
     }
 
     handler.onMessage(channel, data);

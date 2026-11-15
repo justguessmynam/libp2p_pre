@@ -97,6 +97,13 @@ public class HandshakeService implements MessageProcess {
       sendHelloMsg(channel, DisconnectCode.NORMAL, msg.getTimestamp());
     }
     channel.setFinishHandshake(true);
+
+    /*
+     * 必须在确认网络、版本、节点ID均有效之后，
+     * 才能将目标标记为握手成功。
+     */
+    ChannelManager.notifyHandshakeComplete(channel);
+
     channel.updateAvgLatency(System.currentTimeMillis() - channel.getStartTime());
     Parameter.handlerList.forEach(h -> h.onConnect(channel));
   }
