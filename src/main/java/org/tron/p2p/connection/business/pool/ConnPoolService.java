@@ -28,6 +28,7 @@ import org.tron.p2p.P2pEventHandler;
 import org.tron.p2p.base.Parameter;
 import org.tron.p2p.connection.Channel;
 import org.tron.p2p.connection.ChannelManager;
+import org.tron.p2p.connection.business.random.RandomConnectService;
 import org.tron.p2p.connection.message.base.P2pDisconnectMessage;
 import org.tron.p2p.connection.socket.PeerClient;
 import org.tron.p2p.discover.Node;
@@ -93,6 +94,18 @@ public class ConnPoolService extends P2pEventHandler {
     }
   }
 
+  /**
+   * Returns whether RandomConnectService owns the target.
+   */
+  private boolean isRandomManagedTarget(InetSocketAddress address) {
+    if (address == null) {
+      return false;
+    }
+
+    RandomConnectService randomConnectService = ChannelManager.getRandomConnectService();
+    return randomConnectService != null && randomConnectService.isManagedTarget(address);
+  }
+
   private void addNode(Set<InetSocketAddress> inetSet, Node node) {
     if (node != null) {
       if (node.getInetSocketAddressV4() != null) {
@@ -125,8 +138,19 @@ public class ConnPoolService extends P2pEventHandler {
         Parameter.p2pConfig.getIpv6(), Parameter.p2pConfig.getPort()));
 
     p2pConfig.getActiveNodes().forEach(address -> {
-      if (!isFilterActiveNodes && !inetInUse.contains(address) && !addressInUse.contains(
-          address.getAddress())) {
+      // RandomConnectService exclusively dials its managed active nodes.
+      if (isRandomManagedTarget(address)) {
+        inetInUse.add(address);
+        if (address.getAddress() != null) {
+          addressInUse.add(address.getAddress());
+        }
+        return;
+      }
+
+      // Keep the official fallback for an unmanaged active address.
+      if (!isFilterActiveNodes
+          && !inetInUse.contains(address)
+          && !addressInUse.contains(address.getAddress())) {
         addressInUse.add(address.getAddress());
         inetInUse.add(address);
         Node node = new Node(address); //use a random NodeId for config activeNodes
@@ -193,16 +217,21 @@ public class ConnPoolService extends P2pEventHandler {
     log.debug("Lack size:{}, connectNodes size:{}, is disconnect trigger: {}",
         size, connectNodes.size(), isFilterActiveNodes);
     //establish tcp connection with chose nodes by peerClient
-    {
-      connectNodes.forEach(n -> {
-        log.info("Connect to peer {}", n.getPreferInetSocketAddress());
-        peerClient.connectAsync(n, false);
-        peerClientCache.put(n.getPreferInetSocketAddress().getAddress(),
-            System.currentTimeMillis());
-        if (!configActiveNodes.contains(n.getPreferInetSocketAddress())) {
-          connectingPeersCount.incrementAndGet();
-        }
-      });
+    for (Node node : connectNodes) {
+      InetSocketAddress address = node.getPreferInetSocketAddress();
+
+      // Recheck ownership because targets may change after candidate selection.
+      if (isRandomManagedTarget(address)) {
+        log.debug("Skip ConnPool connect for random-managed target {}", address);
+        continue;
+      }
+
+      log.info("Connect to peer {}", address);
+      peerClient.connectAsync(node, false);
+      peerClientCache.put(address.getAddress(), System.currentTimeMillis());
+      if (!configActiveNodes.contains(address)) {
+        connectingPeersCount.incrementAndGet();
+      }
     }
   }
 
@@ -228,9 +257,17 @@ public class ConnPoolService extends P2pEventHandler {
 
   private boolean validNode(Node node, Set<String> nodesInUse, Set<InetSocketAddress> inetInUse,
       Set<InetSocketAddress> dynamicInet) {
-    long now = System.currentTimeMillis();
     InetSocketAddress inetSocketAddress = node.getPreferInetSocketAddress();
+    if (inetSocketAddress == null || isRandomManagedTarget(inetSocketAddress)) {
+      return false;
+    }
+
     InetAddress inetAddress = inetSocketAddress.getAddress();
+    if (inetAddress == null) {
+      return false;
+    }
+
+    long now = System.currentTimeMillis();
     Long forbiddenTime = ChannelManager.getBannedNodes().getIfPresent(inetAddress);
     if ((forbiddenTime != null && now <= forbiddenTime)
         || (ChannelManager.getConnectionNum(inetAddress)
@@ -273,7 +310,8 @@ public class ConnPoolService extends P2pEventHandler {
   }
 
   public void triggerConnect(InetSocketAddress address) {
-    if (configActiveNodes.contains(address)) {
+    // Managed targets reconnect according to the random connection schedule.
+    if (isRandomManagedTarget(address) || configActiveNodes.contains(address)) {
       return;
     }
     connectingPeersCount.decrementAndGet();
