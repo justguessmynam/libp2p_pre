@@ -1,6 +1,8 @@
 package org.tron.p2p.connection.business.random;
 
 import java.net.InetSocketAddress;
+import io.netty.channel.ChannelFuture;
+import io.netty.channel.ChannelFutureListener;
 import java.util.ArrayList;
 import java.util.Collection;
 import java.util.Collections;
@@ -9,7 +11,12 @@ import java.util.List;
 import java.util.Map;
 import java.util.Set;
 import java.util.concurrent.ThreadLocalRandom;
+import java.util.concurrent.Executors;
+import java.util.concurrent.ScheduledExecutorService;
+import java.util.concurrent.TimeUnit;
 import lombok.extern.slf4j.Slf4j;
+import org.apache.commons.lang3.concurrent.BasicThreadFactory;
+import org.tron.p2p.connection.socket.PeerClient;
 import org.tron.p2p.discover.Node;
 import org.tron.p2p.protos.Connect.DisconnectReason;
 
@@ -19,14 +26,32 @@ public class RandomConnectService {
   // 未配置时间基准时，初次连接时间的最大随机延迟。
   private static final long MAX_INITIAL_DELAY_MILLIS = 60_000L;
 
+  // 拨号超过该时间仍未产生结果时，释放dialing状态。
+  private static final long DIALING_TIMEOUT_MILLIS = 15_000L;
+
+  private final PeerClient peerClient;
   private final TargetStateRepo targetStateRepo;
   private final DialTimePolicy dialTimePolicy;
   private final long cooldownMillis;
+  private final long scanIntervalMillis;
+
+  // 单线程扫描，避免同一批目标被并发调度。
+  private final ScheduledExecutorService scheduler = Executors.newSingleThreadScheduledExecutor(
+      BasicThreadFactory.builder()
+          .namingPattern("random-connect-%d")
+          .build());
+
+  private volatile boolean started;
 
   public RandomConnectService(
+      PeerClient peerClient,
       TargetStateRepo targetStateRepo,
       DialTimePolicy dialTimePolicy,
-      long cooldownMillis) {
+      long cooldownMillis,
+      long scanIntervalMillis) {
+    if (peerClient == null) {
+      throw new IllegalArgumentException("peerClient is null");
+    }
     if (targetStateRepo == null) {
       throw new IllegalArgumentException("targetStateRepo is null");
     }
@@ -37,10 +62,55 @@ public class RandomConnectService {
       throw new IllegalArgumentException(
           "cooldownMillis must not be negative");
     }
+    if (scanIntervalMillis <= 0) {
+      throw new IllegalArgumentException(
+          "scanIntervalMillis must be greater than 0");
+    }
 
+    this.peerClient = peerClient;
     this.targetStateRepo = targetStateRepo;
     this.dialTimePolicy = dialTimePolicy;
     this.cooldownMillis = cooldownMillis;
+    this.scanIntervalMillis = scanIntervalMillis;
+  }
+
+  /**
+   * 启动随机连接目标扫描任务。
+   */
+  public synchronized void start() {
+    if (started) {
+      return;
+    }
+
+    started = true;
+
+    scheduler.scheduleAtFixedRate(
+        this::safeScanAndConnect,
+        0,
+        scanIntervalMillis,
+        TimeUnit.MILLISECONDS);
+
+    log.info(
+        "RandomConnectService started, scanInterval={}ms",
+        scanIntervalMillis);
+  }
+
+  /**
+   * 停止随机连接目标扫描任务。
+   */
+  public synchronized void stop() {
+    if (!started) {
+      return;
+    }
+
+    started = false;
+    scheduler.shutdownNow();
+
+    log.info("RandomConnectService stopped");
+  }
+
+  public boolean isStarted() {
+    return started;
   }
 
   /**
@@ -258,6 +328,137 @@ public class RandomConnectService {
 
   public int getTargetCount() {
     return targetStateRepo.size();
+  }
+
+  /**
+   * 执行扫描时隔离异常，避免定时任务因一次异常永久停止。
+   */
+  private void safeScanAndConnect() {
+    if (!started) {
+      return;
+    }
+
+    try {
+      scanAndConnect();
+    } catch (Throwable t) {
+      log.error("Random connect scan failed", t);
+    }
+  }
+
+  /**
+   * 清理超时拨号，然后领取并连接已经到期的目标。
+   */
+  private void scanAndConnect() {
+    long now = System.currentTimeMillis();
+
+    cleanupStaleDialing(now);
+
+    for (TargetPeerState state : claimDueTargets(now)) {
+      doConnect(state);
+    }
+  }
+
+  /**
+   * 清除长时间没有完成的拨号状态。
+   */
+  private void cleanupStaleDialing(long now) {
+    for (TargetPeerState state : targetStateRepo.all()) {
+      synchronized (state) {
+        if (!state.isDialing()) {
+          continue;
+        }
+
+        long lastAttemptAt = state.getLastAttemptAt();
+
+        if (lastAttemptAt <= 0
+            || now - lastAttemptAt <= DIALING_TIMEOUT_MILLIS) {
+          continue;
+        }
+
+        log.warn(
+            "Reset stale random connect dialing, target={}, "
+                + "lastAttemptAt={}",
+            state.getAddress(),
+            lastAttemptAt);
+
+        /*
+         * 此时仍持有state锁，避免连接成功回调和超时清理
+         * 同时修改同一个目标的状态。
+         */
+        onConnectFailed(state.getAddress(), now);
+      }
+    }
+  }
+
+  /**
+   * 使用官方PeerClient接口发起连接。
+   */
+  private void doConnect(TargetPeerState state) {
+    Node node = state.getNode();
+    InetSocketAddress address = state.getAddress();
+
+    log.info("Random connect to {}", address);
+
+    try {
+      ChannelFuture future = peerClient.connect(
+          node,
+          (ChannelFutureListener) result -> handleConnectResult(address, result));
+
+      /*
+       * ChannelManager关闭时PeerClient可能返回null，
+       * 此时释放dialing状态并等待下一轮调度。
+       */
+      if (future == null) {
+        onConnectFailed(
+            address,
+            System.currentTimeMillis());
+      }
+    } catch (RuntimeException e) {
+      log.warn(
+          "Random connect request failed, peer={}, cause={}",
+          address,
+          e.getMessage());
+
+      onConnectFailed(
+          address,
+          System.currentTimeMillis());
+    }
+  }
+
+  /**
+   * 处理Netty TCP连接结果。
+   */
+  private void handleConnectResult(
+      InetSocketAddress address,
+      ChannelFuture future) {
+    long eventTimeMillis = System.currentTimeMillis();
+
+    if (future.isSuccess()) {
+      onChannelConnected(address, eventTimeMillis);
+
+      log.info(
+          "Random connect channel established, target={}, time={}",
+          address,
+          eventTimeMillis);
+
+      return;
+    }
+
+    Throwable cause = future.cause();
+
+    log.warn(
+        "Random connect failed, peer={}, cause={}",
+        address,
+        cause == null ? "unknown" : cause.getMessage());
+
+    onConnectFailed(address, eventTimeMillis);
+
+    /*
+     * 连接失败后关闭Netty channel，释放相关资源。
+     */
+    if (future.channel() != null) {
+      future.channel().close();
+    }
   }
 
   private void refreshNextAttempt(
