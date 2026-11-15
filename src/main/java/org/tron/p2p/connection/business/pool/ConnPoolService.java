@@ -60,14 +60,12 @@ public class ConnPoolService extends P2pEventHandler {
 
   public P2pConfig p2pConfig = Parameter.p2pConfig;
   private PeerClient peerClient;
-  private final List<InetSocketAddress> configActiveNodes = new ArrayList<>();
   private int minCandidateSize = 50;
 
   public ConnPoolService() {
     this.messageTypes = new HashSet<>(); //no message type registers
     try {
       Parameter.addP2pEventHandle(this);
-      configActiveNodes.addAll(p2pConfig.getActiveNodes());
     } catch (P2pException e) {
       //no exception will throw
     }
@@ -229,7 +227,7 @@ public class ConnPoolService extends P2pEventHandler {
       log.info("Connect to peer {}", address);
       peerClient.connectAsync(node, false);
       peerClientCache.put(address.getAddress(), System.currentTimeMillis());
-      if (!configActiveNodes.contains(address)) {
+      if (!p2pConfig.getActiveNodes().contains(address)) {
         connectingPeersCount.incrementAndGet();
       }
     }
@@ -311,7 +309,7 @@ public class ConnPoolService extends P2pEventHandler {
 
   public void triggerConnect(InetSocketAddress address) {
     // Managed targets reconnect according to the random connection schedule.
-    if (isRandomManagedTarget(address) || configActiveNodes.contains(address)) {
+    if (isRandomManagedTarget(address) || p2pConfig.getActiveNodes().contains(address)) {
       return;
     }
     connectingPeersCount.decrementAndGet();

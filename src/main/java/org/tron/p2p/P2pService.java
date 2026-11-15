@@ -5,12 +5,18 @@ import io.netty.channel.ChannelFutureListener;
 import java.net.InetSocketAddress;
 import java.util.ArrayList;
 import java.util.HashSet;
+import java.util.LinkedHashMap;
+import java.util.LinkedHashSet;
 import java.util.List;
+import java.util.Map;
 import java.util.Set;
+import java.util.concurrent.ConcurrentHashMap;
+import java.util.concurrent.CopyOnWriteArrayList;
 import lombok.extern.slf4j.Slf4j;
 import org.tron.p2p.base.Parameter;
 import org.tron.p2p.connection.Channel;
 import org.tron.p2p.connection.ChannelManager;
+import org.tron.p2p.connection.business.random.RandomConnectService;
 import org.tron.p2p.discover.Node;
 import org.tron.p2p.discover.NodeManager;
 import org.tron.p2p.dns.DnsManager;
@@ -56,6 +62,81 @@ public class P2pService {
 
   public ChannelFuture connect(Node node, ChannelFutureListener future) {
     return ChannelManager.connect(node, future);
+  }
+
+  /**
+   * Updates active targets and their optional connection-time baselines.
+   */
+  public synchronized void updateRandomConnectTargets(
+      List<InetSocketAddress> activeNodes,
+      Map<InetSocketAddress, Long> addressTimeMap) {
+    if (isShutdown) {
+      log.warn("Ignore random connect target update because P2pService is shutdown");
+      return;
+    }
+
+    P2pConfig p2pConfig = Parameter.p2pConfig;
+    RandomConnectService randomConnectService = ChannelManager.getRandomConnectService();
+    if (p2pConfig == null || randomConnectService == null) {
+      log.warn("Ignore random connect target update because P2pService is not initialized");
+      return;
+    }
+
+    List<InetSocketAddress> newActiveNodes = normalizeActiveNodes(activeNodes);
+    Map<InetSocketAddress, Long> newAddressTimeMap =
+        normalizeAddressTimeMap(addressTimeMap);
+
+    // Manage the old and new targets during the configuration transition.
+    Set<InetSocketAddress> transitionTargets = new LinkedHashSet<>();
+    if (p2pConfig.getActiveNodes() != null) {
+      transitionTargets.addAll(p2pConfig.getActiveNodes());
+    }
+    transitionTargets.addAll(newActiveNodes);
+
+    randomConnectService.updateTargets(
+        new ArrayList<>(transitionTargets), newAddressTimeMap);
+
+    // Replace the collections atomically instead of exposing a temporary empty state.
+    p2pConfig.setActiveNodes(new CopyOnWriteArrayList<>(newActiveNodes));
+    p2pConfig.setMyAddressTimeMap(new ConcurrentHashMap<>(newAddressTimeMap));
+
+    // Remove targets that are no longer active after the configuration is visible.
+    randomConnectService.updateTargets(newActiveNodes, newAddressTimeMap);
+
+    log.info(
+        "Updated random connect targets, activeNodes={}, timingEntries={}",
+        newActiveNodes.size(),
+        newAddressTimeMap.size());
+  }
+
+  private List<InetSocketAddress> normalizeActiveNodes(
+      List<InetSocketAddress> activeNodes) {
+    Set<InetSocketAddress> normalized = new LinkedHashSet<>();
+    if (activeNodes != null) {
+      for (InetSocketAddress address : activeNodes) {
+        if (address != null) {
+          normalized.add(address);
+        }
+      }
+    }
+    return new ArrayList<>(normalized);
+  }
+
+  private Map<InetSocketAddress, Long> normalizeAddressTimeMap(
+      Map<InetSocketAddress, Long> addressTimeMap) {
+    Map<InetSocketAddress, Long> normalized = new LinkedHashMap<>();
+    if (addressTimeMap == null) {
+      return normalized;
+    }
+
+    for (Map.Entry<InetSocketAddress, Long> entry : addressTimeMap.entrySet()) {
+      InetSocketAddress address = entry.getKey();
+      Long baseTimeMillis = entry.getValue();
+      if (address != null && baseTimeMillis != null) {
+        normalized.put(address, baseTimeMillis);
+      }
+    }
+    return normalized;
   }
 
   public P2pStats getP2pStats() {
