@@ -391,7 +391,7 @@ public class ChannelManager {
       notifyHandshakeComplete(channel);
 
       Parameter.handlerList.forEach(
-          handler -> handler.onConnect(channel));
+          eventHandler -> eventHandler.onConnect(channel));
     }
 
     handler.onMessage(channel, data);
