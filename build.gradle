@@ -197,6 +197,16 @@ publishing {
             name = 'ciLocal'
             url =  "$buildDir/repo"
         }
+        maven {
+            name = "GitHubPackages"
+            url = uri("https://maven.pkg.github.com/justguessmynam/libp2p_jar")
+            credentials {
+                username = providers.gradleProperty("gpr.user").getOrElse(
+                    System.getenv("GITHUB_ACTOR"))
+                password = providers.gradleProperty("gpr.key").getOrElse(
+                    System.getenv("GITHUB_TOKEN"))
+            }
+        }
     }
     publications {
         mavenJava(MavenPublication) {
