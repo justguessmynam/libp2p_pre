@@ -21,7 +21,7 @@ import org.tron.p2p.connection.socket.PeerClient;
 import org.tron.p2p.discover.Node;
 import org.tron.p2p.protos.Connect.DisconnectReason;
 
-@Slf4j(topic = "net")
+@Slf4j(topic = "RANDOM_CONNECT")
 public class RandomConnectService {
 
   // 未配置时间基准时，初次连接时间的最大随机延迟。
@@ -46,11 +46,10 @@ public class RandomConnectService {
           .build());
 
   // 独立输出统计日志，避免影响高频连接扫描。
-  private final ScheduledExecutorService statsScheduler =
-      Executors.newSingleThreadScheduledExecutor(
-          BasicThreadFactory.builder()
-              .namingPattern("random-connect-stats-%d")
-              .build());
+  private final ScheduledExecutorService statsScheduler = Executors.newSingleThreadScheduledExecutor(
+      BasicThreadFactory.builder()
+          .namingPattern("random-connect-stats-%d")
+          .build());
 
   private volatile boolean started;
 
